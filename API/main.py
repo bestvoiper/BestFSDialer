@@ -43,7 +43,7 @@ async def iniciar_discador(request: DiscadorRequest, db: Session = Depends(get_d
 
     # Obtener números pendientes
     query = select(numeros_table.c.telefono).where(
-        (numeros_table.c.estado.is_(None) | (numeros_table.c.estado == 'PENDIENTE')) &
+        (numeros_table.c.estado.is_(None) | (numeros_table.c.estado == 'n')) &
         (numeros_table.c.intentos < campana.reintentos)
     )
     
