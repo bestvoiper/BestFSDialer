@@ -1,0 +1,53 @@
+#!/bin/sh
+# /etc/init.d/enDondeUp
+#
+# Written by Edwar Frank Pons Bessio <edwar.servidor@gmail.com>.
+
+### BEGIN INIT INFO
+# Provides:          enDondeUp
+# Required-Start:    $all
+# Required-Stop:     $all
+# Should-Start:      mysql
+# Should-Stop:
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Control de cambios.
+# Description:       Control de cambios en GUI AsterVoIP a nivel Asterisk.
+### END INIT INFO
+
+. /lib/lsb/init-functions
+
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+NAME=enDondeUp.php
+DAEMON=/usr/local/bin/$NAME
+RUNNING=$(ps -ef | grep "enDondeUp.php" | grep -v grep | awk '{print $2}')
+SERVICE=/etc/init.d/enDondeUp
+
+case "$1" in
+ start)
+  log_daemon_msg "Iniciando script "$NAME
+  if [ "$RUNNING" = "" ]; then
+   start-stop-daemon -S -b -x $DAEMON
+   log_end_msg $?
+  else
+   log_daemon_msg "Script "$NAME" ya iniciado."
+   log_end_msg 0
+  fi
+ ;;
+ stop)
+  log_daemon_msg "Deteniendo script "$NAME
+  start-stop-daemon -K -n $NAME
+  log_end_msg $?
+ ;;
+ restart)
+  $0 stop
+  sleep 2  # It needs some time to really be stopped.
+  $0 start
+ ;;
+ *)
+  echo "Usage: $SERVICE {start|stop|restart|status}" >&2
+  exit 1
+ ;;
+esac
+
+exit 0
