@@ -7,13 +7,13 @@ Wants=mysql.service freeswitch.service
 Type=simple
 User=luis
 Group=www-data
-WorkingDirectory=/var/www/BestFS_Dialer
+WorkingDirectory=/var/www/BestFSDialer
 ExecStart=/bin/bash -c 'source ./venv37/bin/activate && export PYTHONPATH=/usr/src/freeswitch/libs/esl/python3 && python3.7 ./check_calls.py'
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=BestFS_Dialer
+SyslogIdentifier=BestFSDialer
 
 
 [Install]

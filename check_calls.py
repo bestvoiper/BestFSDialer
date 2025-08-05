@@ -449,7 +449,7 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
     stats.campaign_name = campaign_name  # <-- Siempre asegura el nombre correcto
     uuid_map = {}
     delay = 1 / cps
-    engine = create_engine(DB_URL, future=False)
+    engine = create_engine(DB_URL)
     log = logger.info
 
     log(f"🚦 Enviando llamadas a {cps} CPS (~{delay:.3f}s entre originates)")
@@ -565,7 +565,7 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
     return stats
 
 async def main():
-    engine = create_engine(DB_URL, future=False)
+    engine = create_engine(DB_URL)
     campaigns_data = {}
 
     while True:
