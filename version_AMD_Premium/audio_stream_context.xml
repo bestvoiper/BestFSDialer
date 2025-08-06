@@ -1,6 +1,6 @@
 <include>
   <!-- Contexto principal para manejo de audio stream y transferencias -->
-  <context name="Luis_Pruebas2">
+  <context name="DETECT_AMD_PRO">
 
     <!-- Extension: Manejo de llamadas con audio stream automático -->
     <extension name="audio_stream_handler">
@@ -8,8 +8,8 @@
         <!-- Validación de variables críticas -->
         <action application="set" data="error_msg="/>
         <action application="set" data="valid_uuid=${uuid}"/>
-        <action application="set" data="valid_numero=${destination_number}"/>
-        <action application="set" data="valid_campaign=${origination_campaign_name}"/>
+        <action application="set" data="valid_numero=${origination_caller_id_number}"/>
+        <action application="set" data="valid_campaign=${campaign_name}"/>
         <action application="set" data="valid_ws_url=wss://localhost:8080/audio?uuid=${valid_uuid}&numero=${valid_numero}&campaign=${valid_campaign}"/>
         <!-- Si falta alguna variable, loguear y colgar -->
         <action application="eval" data="${valid_uuid} == '' || ${valid_numero} == '' || ${valid_campaign} == ''"/>
@@ -29,27 +29,11 @@
         <action application="log" data="INFO [${campaign_name}] Iniciando audio stream para ${numero}..."/>
         <action application="system" data="fs_cli -p1Pl}0F~~801l -x 'uuid_audio_stream ${uuid} start ${wss_url} mono 16000'"/>
         <action application="log" data="ERR Si el audio stream no inicia, revisar parámetros y conexión WebSocket"/>
-        <action application="set" data="execute_on_answer=system fs_cli -p1Pl}0F~~801l -x 'uuid_audio_stream ${uuid} stop';transfer 9999 XML Luis_Pruebas2"/>
-        <action application="log" data="INFO [${campaign_name}] Transferencia automática a 9999@Luis_Pruebas2 en llamada contestada"/>
+        <action application="set" data="execute_on_answer=system fs_cli -p1Pl}0F~~801l -x 'uuid_audio_stream ${uuid} stop';transfer 9999 XML ${campaign_name}"/>
+        <action application="log" data="INFO [${campaign_name}] Transferencia automática a 9999@${campaign_name} en llamada contestada"/>
         <action application="log" data="INFO [${campaign_name}] Audio stream iniciado para ${numero}"/>
         <action application="log" data="INFO [${campaign_name}] Manteniendo llamada ${numero} en park..."/>
         <action application="park"/>
-      </condition>
-    </extension>
-
-    <!-- Extension: Ejecutar acciones al contestar llamada transferida -->
-    <extension name="execute_on_answer">
-      <condition field="destination_number" expression="^9999$">
-        <!-- Validación de UUID -->
-        <action application="set" data="call_uuid=${uuid}"/>
-        <action application="eval" data="${call_uuid} == ''"/>
-        <action application="log" data="ERR UUID vacío en transferencia"/>
-        <action application="hangup"/>
-        <!-- Si todo está bien, continuar -->
-        <action application="answer"/>
-        <action application="sleep" data="1000"/>
-        <action application="playback" data="/var/www/bestcallcenter/views/Config/masivosAudios/Luis_Pruebas2.wav"/>
-        <action application="hangup"/>
       </condition>
     </extension>
 
@@ -68,18 +52,6 @@
         <action application="log" data="ERR Si el audio stream no se detiene, revisar UUID y estado de llamada"/>
         <!-- Mantener llamada en park -->
         <action application="log" data="INFO [${origination_campaign_name}] Transferencia completada, manteniendo en park"/>
-        <action application="park"/>
-      </condition>
-    </extension>
-
-    <!-- Extension: Debug y testing de canal -->
-    <extension name="debug_info">
-      <condition field="destination_number" expression="^debug$">
-        <action application="log" data="DEBUG Variables de canal:"/>
-        <action application="log" data="DEBUG - UUID: ${uuid}"/>
-        <action application="log" data="DEBUG - Destination: ${destination_number}"/>
-        <action application="log" data="DEBUG - Campaign: ${origination_campaign_name}"/>
-        <action application="log" data="DEBUG - Caller ID: ${caller_id_number}"/>
         <action application="park"/>
       </condition>
     </extension>

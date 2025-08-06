@@ -198,11 +198,9 @@ def update_call_status(campaign_name, numero, estado, engine, duracion="0", incr
 
 # Guarda el tiempo de respuesta por llamada contestada
 answered_times = {}
-# Guardar URLs de stream por UUID para iniciar cuando el canal esté listo
-pending_streams = {}
 
 async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
-    global answered_times, pending_streams
+    global answered_times
     destino_transfer = "9999"
     try:
         event = con.recvEventTimed(100)
@@ -230,29 +228,6 @@ async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
             stats.print_live_stats(campaign_name)
             update_call_status(campaign_name, numero, "P", engine, uuid=uuid)
             
-            # Iniciar audio stream cuando el canal está en progreso
-            if uuid in pending_streams:
-                wss_url_con_params = pending_streams[uuid]
-                stream_cmd = f"{uuid} start {wss_url_con_params} mono 16000"
-                logger.debug(f"📡 Comando stream para {numero} (en progreso): {stream_cmd}")
-                
-                try:
-                    res3 = con.api("uuid_audio_stream", stream_cmd)
-                    if res3 and res3.getBody():
-                        stream_response = res3.getBody()
-                        logger.debug(f"📡 Respuesta stream para {numero}: {stream_response}")
-                        if "+OK" in stream_response:
-                            logger.info(f"✅ Audio stream iniciado exitosamente para {numero}")
-                        else:
-                            logger.warning(f"⚠️ Posible error en stream para {numero}: {stream_response}")
-                    else:
-                        logger.warning(f"❌ Sin respuesta del comando audio stream para {numero}")
-                except Exception as e:
-                    logger.error(f"❌ Error iniciando audio stream para {numero}: {e}")
-                
-                # Remover de pending ya que se procesó
-                pending_streams.pop(uuid, None)
-            
             await safe_send_to_websocket(send_event_to_websocket, "call_progress", {
                 "campaign": campaign_name,
                 "numero": numero,
@@ -270,29 +245,6 @@ async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
             update_call_status(campaign_name, numero, "S", engine, uuid=uuid)
             answered_times[(campaign_name, numero)] = time.time()
             stats.print_live_stats(campaign_name)
-            
-            # Si no se inició el stream en PROGRESS_MEDIA, iniciarlo ahora
-            if uuid in pending_streams:
-                wss_url_con_params = pending_streams[uuid]
-                stream_cmd = f"{uuid} start {wss_url_con_params} mono 16000"
-                logger.debug(f"📡 Comando stream para {numero} (contestada): {stream_cmd}")
-                
-                try:
-                    res3 = con.api("uuid_audio_stream", stream_cmd)
-                    if res3 and res3.getBody():
-                        stream_response = res3.getBody()
-                        logger.debug(f"📡 Respuesta stream para {numero}: {stream_response}")
-                        if "+OK" in stream_response:
-                            logger.info(f"✅ Audio stream iniciado exitosamente para {numero}")
-                        else:
-                            logger.warning(f"⚠️ Posible error en stream para {numero}: {stream_response}")
-                    else:
-                        logger.warning(f"❌ Sin respuesta del comando audio stream para {numero}")
-                except Exception as e:
-                    logger.error(f"❌ Error iniciando audio stream para {numero}: {e}")
-                
-                # Remover de pending ya que se procesó
-                pending_streams.pop(uuid, None)
             
             await safe_send_to_websocket(send_event_to_websocket, "call_answered", {
                 "campaign": campaign_name,
@@ -318,16 +270,6 @@ async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
             causa = extract_field(event_str, "Hangup-Cause")
             stats.ringing_numbers.discard(numero)
             stats.active_numbers.discard(numero)
-
-            # Detener audio stream si estaba activo
-            try:
-                stop_stream_cmd = f"{uuid} stop"
-                logger.debug(f"🛑 Deteniendo stream para {numero}: {stop_stream_cmd}")
-                stop_res = con.api("uuid_audio_stream", stop_stream_cmd)
-                if stop_res and stop_res.getBody():
-                    logger.debug(f"🛑 Respuesta stop stream para {numero}: {stop_res.getBody()}")
-            except Exception as e:
-                logger.debug(f"⚠️ Error deteniendo stream para {numero}: {e}")
 
             # 👉 Identificar quién colgó
             hangup_disposition = extract_field(event_str, "variable_sip_hangup_disposition")
@@ -600,21 +542,16 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
         for numero in batch:
             uuid = f"{campaign_name}_{numero}_{int(time.time()*1000)}"
             uuid_map[numero] = uuid
-            # Originate directo al contexto audio_stream_context, sin &park()
+            # Originate directo al contexto, sin &park()
             originate_str = (
                 f"bgapi originate "
                 f"{{origination_caller_id_name='Outbound',ignore_early_media=false,"
                 f"origination_uuid={uuid},"
                 f"campaign_name='{campaign_name}',"
                 f"origination_caller_id_number='{numero}'}}"
-                f"sofia/gateway/{GATEWAY}/{numero} 2222 XML {campaign_name}"
+                f"sofia/gateway/{GATEWAY}/{numero} &park()"
             )
             con.api(originate_str)
-            
-            # Preparar URL del stream para cuando el canal esté listo
-            wss_url_con_params = f"ws://localhost:8081/audio?uuid={uuid}&numero={numero}&campaign={campaign_name}"
-            pending_streams[uuid] = wss_url_con_params
-            logger.debug(f"📡 Stream preparado para {numero}: {wss_url_con_params}")
             
             # Insertar el uuid en la base de datos al iniciar la llamada y actualizar fecha_envio
             try:
@@ -635,7 +572,6 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
                 "campaign": campaign_name,
                 "numero": numero,
                 "uuid": uuid,
-                "wss_url": wss_url_con_params,
                 "status": "pending",
                 "stats": stats.to_dict()
             })

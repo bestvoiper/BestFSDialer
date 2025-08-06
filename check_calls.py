@@ -1,13 +1,44 @@
 import asyncio
 import time
 import json
-from datetime import datetime
+from datetime import datetime, time as dt_time
+import re
 from sqlalchemy import create_engine, text
 import logging
 import sys
-import websockets
-from vosk import Model, KaldiRecognizer
-import subprocess
+
+def is_now_in_campaign_schedule(horario_str):
+    """Verifica si el horario actual está dentro del rango permitido."""
+    if not horario_str:
+        return True  # Si no hay restricción, permitir
+
+    try:
+        # Separar días y horas
+        dias, horas = horario_str.split('|')
+        # Días: "1-5" (Lunes=1, Domingo=7)
+        day_range = dias.split('-')
+        if len(day_range) == 2:
+            day_start, day_end = int(day_range[0]), int(day_range[1])
+        else:
+            day_start = day_end = int(day_range[0])
+        
+        # Horas: "0900-1800"
+        hour_start = dt_time(int(horas[:2]), int(horas[2:4]))
+        hour_end = dt_time(int(horas[5:7]), int(horas[7:9]))
+        
+        now = datetime.now()
+        weekday = now.isoweekday()  # Lunes=1, Domingo=7
+        now_time = now.time()
+        
+        # Verificar día y hora
+        if not (day_start <= weekday <= day_end):
+            return False
+        if not (hour_start <= now_time <= hour_end):
+            return False
+        return True
+    except Exception as e:
+        logger.error(f"Error verificando horario '{horario_str}': {e}")
+        return True  # Si hay error en el formato, permitir por defecto
 
 # Configurar logging
 logging.basicConfig(
@@ -21,7 +52,7 @@ FREESWITCH_HOST = "127.0.0.1"
 FREESWITCH_PORT = 8021
 FREESWITCH_PASSWORD = "1Pl}0F~~801l"
 GATEWAY = "gw_pstn"
-DB_URL = "mysql+pymysql://consultas:consultas@localhost/autodialer"
+DB_URL = "mysql+pymysql://consultas:consultas@localhost/masivos"
 
 try:
     import ESL
@@ -98,156 +129,110 @@ def extract_field(event_str, field):
     except:
         return ""
 
-def update_call_status(campaign_name, numero, estado, engine, duracion="0", incrementar_intento=None, max_intentos=None):
+def update_call_status(campaign_name, numero, estado, engine, duracion="0", incrementar_intento=None, max_intentos=None, uuid=None, hangup_reason=None):
     if not campaign_name:
         logger.error(f"Error actualizando estado: campaign_name vacío para número {numero}, estado {estado}")
         return
     try:
         with engine.begin() as conn:
-            # Lógica para incrementar intentos:
-            # - Si estado es 'P', siempre poner intentos=1 si es la primera vez (no sumar más de 1)
-            # - Si estado es 'N', solo incrementar si intentos < max_intentos
-            if estado == "P":
-                # Solo poner intentos=1 si es la primera vez
-                stmt = text(f"""
-                    UPDATE {campaign_name}
-                    SET estado = :estado,
-                        duracion = :duracion,
-                        intentos = CASE WHEN intentos < 1 THEN 1 ELSE intentos END
-                    WHERE telefono = :numero
-                """)
-                conn.execute(stmt, {"estado": estado, "duracion": duracion, "numero": numero})
-            elif estado == "N" and max_intentos is not None:
-                # Solo incrementar si no supera el máximo
-                intentos_actual = conn.execute(
-                    text(f"SELECT intentos FROM {campaign_name} WHERE telefono = :numero"),
-                    {"numero": numero}
-                ).scalar() or 0
-                if intentos_actual + 1 < max_intentos:
-                    stmt = text(f"""
-                        UPDATE {campaign_name}
-                        SET estado = :estado,
-                            duracion = :duracion,
-                            intentos = intentos + 1
-                        WHERE telefono = :numero
-                    """)
-                else:
-                    stmt = text(f"""
-                        UPDATE {campaign_name}
-                        SET estado = :estado,
-                            duracion = :duracion
-                        WHERE telefono = :numero
-                    """)
-                conn.execute(stmt, {"estado": estado, "duracion": duracion, "numero": numero})
+            # --- Actualizar por UUID si está disponible ---
+            where_clause = "uuid = :uuid" if uuid else "telefono = :numero"
+            params = {"estado": estado, "duracion": duracion}
+            if uuid:
+                params["uuid"] = uuid
             else:
-                # Otros estados no incrementan intentos
+                params["numero"] = numero
+            
+            # Agregar hangup_reason si está disponible
+            if hangup_reason:
+                params["hangup_reason"] = hangup_reason
+
+            if estado == "pendiente" or estado == "P":
+                update_fields = "estado = :estado, duracion = :duracion, intentos = CASE WHEN intentos < 1 THEN 1 ELSE intentos END"
+                if hangup_reason:
+                    update_fields += ", hangup_reason = :hangup_reason"
+                
                 stmt = text(f"""
                     UPDATE {campaign_name}
-                    SET estado = :estado,
-                        duracion = :duracion
+                    SET {update_fields},
+                        uuid = :uuid
                     WHERE telefono = :numero
+                """) if not uuid else text(f"""
+                    UPDATE {campaign_name}
+                    SET {update_fields}
+                    WHERE uuid = :uuid
                 """)
-                conn.execute(stmt, {"estado": estado, "duracion": duracion, "numero": numero})
+                conn.execute(stmt, {**params, "numero": numero, "uuid": uuid})
+            elif estado == "N" and max_intentos is not None:
+                intentos_actual = conn.execute(
+                    text(f"SELECT intentos FROM {campaign_name} WHERE {where_clause}"),
+                    params
+                ).scalar() or 0
+                
+                update_fields = "estado = :estado, duracion = :duracion"
+                if hangup_reason:
+                    update_fields += ", hangup_reason = :hangup_reason"
+                
+                if intentos_actual + 1 < max_intentos:
+                    update_fields += ", intentos = intentos + 1"
+                
+                stmt = text(f"""
+                    UPDATE {campaign_name}
+                    SET {update_fields}
+                    WHERE {where_clause}
+                """)
+                conn.execute(stmt, params)
+            else:
+                update_fields = "estado = :estado, duracion = :duracion"
+                if hangup_reason:
+                    update_fields += ", hangup_reason = :hangup_reason"
+                
+                stmt = text(f"""
+                    UPDATE {campaign_name}
+                    SET {update_fields}
+                    WHERE {where_clause}
+                """)
+                conn.execute(stmt, params)
     except Exception as e:
         logger.error(f"Error actualizando estado en campaña '{campaign_name}': {e}")
 
 # Guarda el tiempo de respuesta por llamada contestada
 answered_times = {}
 
-# Palabras clave de buzón de voz
-BUZON_KEYWORDS = [
-    "no se encuentra disponible",
-    "deje su mensaje",
-    "la persona a la que ha llamado",
-    "buzon de voz",
-    "casilla de mensajes",
-    "casilla de voz",
-    "persona",
-    "mensaje",
-    "costo",
-    "buzon",
-    "grabar",
-    "tono",
-    "voz"
-]
-
-VOSK_MODEL_PATH = "/usr/local/freeswitch/grammar/model"  # Ajusta la ruta a tu modelo
-vosk_model = None
-try:
-    vosk_model = Model(VOSK_MODEL_PATH)
-except Exception as e:
-    logger.warning(f"No se pudo cargar el modelo Vosk: {e}")
-
-def detect_amd_vosk_realtime(audio_stream_generator):
-    """
-    Procesa audio PCM en tiempo real usando Vosk y detecta si es humano o buzón.
-    audio_stream_generator: un generador que produce bytes de audio PCM 8kHz mono.
-    Retorna: "human" o "machine"
-    """
-    if not vosk_model:
-        logger.warning("Modelo Vosk no cargado, AMD deshabilitado.")
-        return "human"
-    rec = KaldiRecognizer(vosk_model, 8000)
-    is_machine = False
-    found_keyword = None
-    last_text = ""
-    for chunk in audio_stream_generator:
-        if not chunk:
-            continue
-        if rec.AcceptWaveform(chunk):
-            result = rec.Result()
-            text = json.loads(result).get("text", "").lower()
-            last_text = text
-            logger.info(f"VOSK FINAL: {text}")
-            for keyword in BUZON_KEYWORDS:
-                if keyword in text:
-                    is_machine = True
-                    found_keyword = keyword
-                    logger.info(f"VOSK AMD: Palabra clave FINAL detectada: '{keyword}' en '{text}'")
-                    break
-            if is_machine:
-                break
-        else:
-            partial = json.loads(rec.PartialResult()).get("partial", "").lower()
-            if partial:
-                logger.info(f"VOSK PARCIAL: {partial}")
-            for palabra in BUZON_KEYWORDS:
-                if palabra in partial:
-                    is_machine = True
-                    found_keyword = palabra
-                    logger.info(f"VOSK AMD: Palabra clave PARCIAL detectada: '{palabra}' en '{partial}'")
-                    break
-            if is_machine:
-                break
-    # --- NUEVO: Si no se detecta buzón pero el texto está vacío, asume buzón ---
-    if is_machine:
-        logger.info(f"VOSK AMD: Detectado BUZÓN por palabra clave: '{found_keyword}'")
-        return "machine"
-    elif not last_text.strip():
-        logger.info("VOSK AMD: No se detectó texto, se asume BUZÓN")
-        return "machine"
-    else:
-        logger.info("VOSK AMD: No se detectó buzón, se asume HUMANO")
-        return "human"
-
 async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
     global answered_times
+    destino_transfer = "9999"
     try:
         event = con.recvEventTimed(100)
         if not event:
             return
         event_str = event.serialize()
-        numero = extract_field(event_str, "Caller-Destination-Number")
+        
+        numero = extract_field(event_str, "origination_caller_id_number")
+        if not numero:
+            numero = extract_field(event_str, "variable_callee_id_number")
+        if not numero:
+            numero = extract_field(event_str, "Caller-Destination-Number")
+        if not numero:
+            numero = extract_field(event_str, "Caller-Caller-ID-Number")
         uuid = extract_field(event_str, "Unique-ID")
 
-        if "CHANNEL_PROGRESS" in event_str or "CHANNEL_PROGRESS_MEDIA" in event_str:
-            logger.info(f"🔔 Llamada sonando: {numero}")
+        if numero == destino_transfer or not numero:
+            logger.debug(f"Ignorando evento para número vacío o de transferencia: {numero}")
+            return
+
+        if "CHANNEL_PROGRESS_MEDIA" in event_str:
+            logger.info(f"🔔 Llamada en progreso: {numero}")
             stats.ringing_numbers.add(numero)
             stats.active_numbers.add(numero)
             stats.print_live_stats(campaign_name)
-            await safe_send_to_websocket(send_event_to_websocket, "call_ringing", {
+            update_call_status(campaign_name, numero, "P", engine, uuid=uuid)
+            
+            await safe_send_to_websocket(send_event_to_websocket, "call_progress", {
                 "campaign": campaign_name,
                 "numero": numero,
+                "uuid": uuid,
+                "status": "in_progress",
                 "stats": stats.to_dict()
             })
             await safe_send_to_websocket(send_stats_to_websocket, stats.to_dict())
@@ -257,67 +242,28 @@ async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
             stats.calls_answered += 1
             stats.ringing_numbers.discard(numero)
             stats.active_numbers.add(numero)
-            update_call_status(campaign_name, numero, "S", engine)
+            update_call_status(campaign_name, numero, "S", engine, uuid=uuid)
             answered_times[(campaign_name, numero)] = time.time()
             stats.print_live_stats(campaign_name)
+            
             await safe_send_to_websocket(send_event_to_websocket, "call_answered", {
                 "campaign": campaign_name,
                 "numero": numero,
+                "uuid": uuid,
                 "stats": stats.to_dict()
             })
             await safe_send_to_websocket(send_stats_to_websocket, stats.to_dict())
 
-            # --- AMD Vosk en tiempo real ---
-            # Aquí deberías obtener el audio PCM en tiempo real del canal contestado.
-            # Solución: usa sox para leer el audio del canal grabado en tiempo real (requiere que FreeSWITCH grabe el canal a un archivo .wav)
-            # Si tienes mod_sofia o mod_dptools, puedes usar record_session en el dialplan para grabar el canal a /tmp/{uuid}.wav
-
-            def audio_stream_generator():
-                import time
-                import os
-                import wave
-
-                audio_path = f"/tmp/{uuid}.wav"
-                waited = 0
-                # Espera a que el archivo exista y tenga algo de tamaño
-                while not os.path.exists(audio_path) or os.path.getsize(audio_path) < 8000:
-                    time.sleep(0.1)
-                    waited += 0.1
-                    if waited > 5:
-                        break
-                if not os.path.exists(audio_path):
-                    return
-                try:
-                    wf = wave.open(audio_path, "rb")
-                    while True:
-                        data = wf.readframes(4000)
-                        if not data:
-                            time.sleep(0.1)  # Espera a que se grabe más audio
-                            continue
-                        yield data
-                        if wf.tell() >= wf.getnframes():
-                            break
-                    wf.close()
-                except Exception as e:
-                    logger.error(f"Error leyendo audio para AMD Vosk: {e}")
-                    return
-
-            amd_result = detect_amd_vosk_realtime(audio_stream_generator())
-            if amd_result == "machine":
-                logger.info(f"🤖 AMD: Buzón detectado para {numero} (uuid={uuid})")
-                if uuid:
-                    con.api(f"uuid_kill {uuid}")
+            # Transferir después de contestar
+            transfer_cmd = f"uuid_transfer {uuid} 9999 XML {campaign_name}"
+            response = con.api(transfer_cmd)
+            if "+OK" in response.getBody():
+                logger.info(f"✅ Llamada transferida a 9999@{campaign_name} para {numero}")
+                stats.calls_answered -= 1
+                stats.active_numbers.discard(numero)
+                await safe_send_to_websocket(send_stats_to_websocket, stats.to_dict())
             else:
-                logger.info(f"🧑 AMD: Humano detectado para {numero} (uuid={uuid})")
-                if uuid:
-                    transfer_cmd = f"uuid_transfer {uuid} 9999 XML default"
-                    response = con.api(transfer_cmd)
-                    if "+OK" in response.getBody():
-                        logger.info(f"✅ Llamada transferida a 9999@default para {numero}")
-                    else:
-                        logger.warning(f"❌ Fallo al transferir llamada {numero}: {response.getBody()}")
-                else:
-                    logger.warning(f"❌ No se pudo obtener UUID para transferir llamada contestada {numero}")
+                logger.warning(f"❌ Fallo al transferir llamada {numero}: {response.getBody()}")
 
         elif "CHANNEL_HANGUP_COMPLETE" in event_str:
             duracion = extract_field(event_str, "variable_duration")
@@ -325,10 +271,29 @@ async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
             stats.ringing_numbers.discard(numero)
             stats.active_numbers.discard(numero)
 
+            # 👉 Identificar quién colgó
+            hangup_disposition = extract_field(event_str, "variable_sip_hangup_disposition")
+            hangup_reason = ""
+            if hangup_disposition == "recv_bye":
+                logger.info(f"📴 El cliente colgó la llamada: {numero}")
+                hangup_reason = "client_hangup"
+            elif hangup_disposition == "send_bye":
+                logger.info(f"📴 El servidor colgó la llamada: {numero}")
+                hangup_reason = "server_hangup"
+            elif hangup_disposition == "recv_cancel":
+                logger.info(f"❌ El cliente canceló antes de contestar: {numero}")
+                hangup_reason = "client_cancel"
+            elif hangup_disposition == "send_cancel":
+                logger.info(f"❌ El servidor canceló antes de contestar: {numero}")
+                hangup_reason = "server_cancel"
+            else:
+                logger.info(f"🔍 Disposición de colgado desconocida o no SIP: {hangup_disposition}")
+                hangup_reason = hangup_disposition or "unknown"
+
             try:
                 with engine.connect() as conn_db:
-                    query = text(f"SELECT estado, intentos FROM {campaign_name} WHERE telefono = :numero")
-                    result = conn_db.execute(query, {"numero": numero}).fetchone()
+                    query = text(f"SELECT estado, intentos FROM {campaign_name} WHERE uuid = :uuid")
+                    result = conn_db.execute(query, {"uuid": uuid}).fetchone()
                     estado_actual = result[0] if result else None
                     intentos_actual = result[1] if result else 0
             except Exception as e:
@@ -338,63 +303,144 @@ async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
 
             if causa == "NORMAL_CLEARING":
                 logger.info(f"✅ Llamada completada: {numero}, Duración: {duracion}")
-                if estado_actual == "S" and (campaign_name, numero) in answered_times:
-                    answered_at = answered_times.pop((campaign_name, numero))
-                    real_duration = int(time.time() - answered_at)
-                    update_call_status(campaign_name, numero, "C", engine, str(real_duration), incrementar_intento=False)
+                real_duration = None
+                if estado_actual == "S":
+                    if (campaign_name, numero) in answered_times:
+                        answered_at = answered_times.pop((campaign_name, numero))
+                        real_duration = int(time.time() - answered_at)
+                    update_call_status(
+                        campaign_name, numero, "C", engine,
+                        str(real_duration) if real_duration is not None else duracion,
+                        incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason
+                    )
                 else:
-                    update_call_status(campaign_name, numero, "C", engine, incrementar_intento=False)
+                    update_call_status(campaign_name, numero, "C", engine, duracion, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
                 await safe_send_to_websocket(send_event_to_websocket, "call_completed", {
                     "campaign": campaign_name,
                     "numero": numero,
-                    "duracion": str(real_duration) if estado_actual == "S" and 'real_duration' in locals() else duracion,
+                    "uuid": uuid,
+                    "duracion": str(real_duration) if real_duration is not None else duracion,
+                    "hangup_reason": hangup_reason,
                     "stats": stats.to_dict()
                 })
             elif causa in ["USER_BUSY", "CALL_REJECTED"]:
                 logger.info(f"📵 Línea ocupada: {numero}")
-                stats.calls_busy += 1  # Para compatibilidad, pero solo cuenta únicos en .to_dict()
+                stats.calls_busy += 1
                 stats.unique_busy.add(numero)
-                update_call_status(campaign_name, numero, "O", engine, incrementar_intento=False)
+                update_call_status(campaign_name, numero, "O", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
                 await safe_send_to_websocket(send_event_to_websocket, "call_busy", {
                     "campaign": campaign_name,
                     "numero": numero,
+                    "uuid": uuid,
                     "causa": causa,
+                    "hangup_reason": hangup_reason,
                     "stats": stats.to_dict()
                 })
             elif causa in ["NO_ANSWER", "ORIGINATOR_CANCEL"]:
                 logger.info(f"📴 Sin respuesta: {numero}")
-                stats.calls_no_answer += 1  # Para compatibilidad, pero solo cuenta únicos en .to_dict()
+                stats.calls_no_answer += 1
                 stats.unique_no_answer.add(numero)
                 update_call_status(
                     campaign_name, numero, "N", engine,
-                    incrementar_intento=None, max_intentos=max_intentos
+                    incrementar_intento=None, max_intentos=max_intentos, uuid=uuid, hangup_reason=hangup_reason
                 )
                 await safe_send_to_websocket(send_event_to_websocket, "call_no_answer", {
                     "campaign": campaign_name,
                     "numero": numero,
+                    "uuid": uuid,
                     "causa": causa,
+                    "hangup_reason": hangup_reason,
                     "stats": stats.to_dict()
                 })
             elif causa == "NO_USER_RESPONSE":
                 logger.info(f"📴 Sin respuesta del usuario: {numero}")
                 stats.calls_no_answer += 1
                 stats.unique_no_answer.add(numero)
-                update_call_status(campaign_name, numero, "U", engine, incrementar_intento=False)
+                update_call_status(campaign_name, numero, "U", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
                 await safe_send_to_websocket(send_event_to_websocket, "call_no_answer_user", {
                     "campaign": campaign_name,
                     "numero": numero,
+                    "uuid": uuid,
                     "causa": causa,
+                    "hangup_reason": hangup_reason,
+                    "stats": stats.to_dict()
+                })
+            elif causa == "NORMAL_TEMPORARY_FAILURE":
+                logger.info(f"🚫 Sin canales disponibles: {numero}")
+                stats.calls_failed += 1
+                stats.unique_failed.add(numero)
+                update_call_status(campaign_name, numero, "E", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
+                await safe_send_to_websocket(send_event_to_websocket, "call_no_channels", {
+                    "campaign": campaign_name,
+                    "numero": numero,
+                    "uuid": uuid,
+                    "causa": causa,
+                    "hangup_reason": hangup_reason,
+                    "stats": stats.to_dict()
+                })
+            elif causa == "NO_ROUTE_DESTINATION":
+                logger.info(f"🗺️ Sin ruta de destino: {numero}")
+                stats.calls_failed += 1
+                stats.unique_failed.add(numero)
+                update_call_status(campaign_name, numero, "R", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
+                await safe_send_to_websocket(send_event_to_websocket, "call_no_route", {
+                    "campaign": campaign_name,
+                    "numero": numero,
+                    "uuid": uuid,
+                    "causa": causa,
+                    "hangup_reason": hangup_reason,
+                    "stats": stats.to_dict()
+                })
+            elif causa == "UNALLOCATED_NUMBER":
+                logger.info(f"❌ Número inexistente: {numero}")
+                stats.calls_failed += 1
+                stats.unique_failed.add(numero)
+                update_call_status(campaign_name, numero, "I", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
+                await safe_send_to_websocket(send_event_to_websocket, "call_invalid_number", {
+                    "campaign": campaign_name,
+                    "numero": numero,
+                    "uuid": uuid,
+                    "causa": causa,
+                    "hangup_reason": hangup_reason,
+                    "stats": stats.to_dict()
+                })
+            elif causa == "INCOMPATIBLE_DESTINATION":
+                logger.info(f"🔧 Codecs incompatibles: {numero}")
+                stats.calls_failed += 1
+                stats.unique_failed.add(numero)
+                update_call_status(campaign_name, numero, "X", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
+                await safe_send_to_websocket(send_event_to_websocket, "call_incompatible", {
+                    "campaign": campaign_name,
+                    "numero": numero,
+                    "uuid": uuid,
+                    "causa": causa,
+                    "hangup_reason": hangup_reason,
+                    "stats": stats.to_dict()
+                })
+            elif causa == "RECOVERY_ON_TIMER_EXPIRE":
+                logger.info(f"⏰ Timeout SIP: {numero}")
+                stats.calls_no_answer += 1
+                stats.unique_no_answer.add(numero)
+                update_call_status(campaign_name, numero, "T", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
+                await safe_send_to_websocket(send_event_to_websocket, "call_timeout", {
+                    "campaign": campaign_name,
+                    "numero": numero,
+                    "uuid": uuid,
+                    "causa": causa,
+                    "hangup_reason": hangup_reason,
                     "stats": stats.to_dict()
                 })
             else:
                 logger.info(f"❌ Llamada fallida: {numero}, Causa: {causa}")
                 stats.calls_failed += 1
                 stats.unique_failed.add(numero)
-                update_call_status(campaign_name, numero, "E", engine, incrementar_intento=False)
+                update_call_status(campaign_name, numero, "E", engine, incrementar_intento=False, uuid=uuid, hangup_reason=hangup_reason)
                 await safe_send_to_websocket(send_event_to_websocket, "call_failed", {
                     "campaign": campaign_name,
                     "numero": numero,
+                    "uuid": uuid,
                     "causa": causa,
+                    "hangup_reason": hangup_reason,
                     "stats": stats.to_dict()
                 })
 
@@ -403,43 +449,6 @@ async def handle_events_inline(con, campaign_name, stats, engine, max_intentos):
 
     except Exception as e:
         logger.error(f"Error en handle_events_inline: {e}")
-
-# --- NUEVA FUNCIÓN PARA VINCULAR CON VOSK AMD ---
-async def start_vosk_amd(uuid, numero, campaign_name):
-    """
-    Envía audio RTP a Vosk AMD server vía WebSocket y espera resultado.
-    Cuando detecta humano, transfiere la llamada; si es máquina, cuelga o marca variable.
-    """
-    vosk_ws_url = "ws://127.0.0.1:2700"  # Cambia si tu server Vosk está en otro host/puerto
-    try:
-        # Conecta al WebSocket de Vosk
-        async with websockets.connect(vosk_ws_url) as ws:
-            logger.info(f"🔊 Enviando audio de llamada {numero} (uuid={uuid}) a Vosk AMD...")
-            # Aquí deberías enviar el audio RTP de la llamada a Vosk.
-            # Esto depende de tu integración FreeSWITCH: puedes usar mod_rtc, mod_sofia, o grabar y reenviar el audio.
-            # Por simplicidad, aquí solo escuchamos el resultado de Vosk.
-            while True:
-                msg = await ws.recv()
-                data = json.loads(msg)
-                if data.get("is_machine"):
-                    logger.info(f"🤖 AMD: Buzón detectado para {numero} (uuid={uuid})")
-                    # Puedes colgar la llamada o marcar variable en FreeSWITCH
-                    # Ejemplo: colgar
-                    import ESL
-                    con = ESL.ESLconnection(FREESWITCH_HOST, FREESWITCH_PORT, FREESWITCH_PASSWORD)
-                    if con.connected():
-                        con.api(f"uuid_kill {uuid}")
-                    break
-                elif "text" in data or data.get("confidence", 0) > 0.4:
-                    logger.info(f"🧑 AMD: Humano detectado para {numero} (uuid={uuid})")
-                    # Transferir la llamada a 9999
-                    import ESL
-                    con = ESL.ESLconnection(FREESWITCH_HOST, FREESWITCH_PORT, FREESWITCH_PASSWORD)
-                    if con.connected():
-                        con.api(f"uuid_transfer {uuid} 9999 XML default")
-                    break
-    except Exception as e:
-        logger.error(f"Error en AMD Vosk para {numero} (uuid={uuid}): {e}")
 
 async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_intentos, stats=None):
     if not 1 <= cps <= 100:
@@ -491,24 +500,81 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
 
     stats_task = asyncio.create_task(live_stats_updater())
 
+    # Procesa eventos en segundo plano mientras envía lotes
+    async def event_processor():
+        while stats.calls_sent < total or stats.active_numbers or stats.ringing_numbers:
+            await handle_events_inline(con, campaign_name, stats, engine, max_intentos)
+            await asyncio.sleep(0.01)
+    event_task = asyncio.create_task(event_processor())
+
     while i < total:
+        # 🕐 Validar horario antes de enviar cada lote
+        try:
+            with engine.connect() as conn_schedule:
+                horario_result = conn_schedule.execute(text(f"SELECT horarios FROM campañas WHERE nombre = :nombre"), {"nombre": campaign_name}).fetchone()
+                horario_actual = horario_result[0] if horario_result else None
+                
+                if horario_actual and not is_now_in_campaign_schedule(horario_actual):
+                    log(f"⏸️ Campaña {campaign_name} fuera de horario ({horario_actual}) - pausando campaña")
+                    
+                    # Actualizar estado de la campaña a 'P' (pausada)
+                    try:
+                        with engine.begin() as conn_update:
+                            conn_update.execute(text("UPDATE campañas SET activo = 'P' WHERE nombre = :nombre"), {"nombre": campaign_name})
+                            log(f"✅ Campaña {campaign_name} marcada como pausada (P) en base de datos")
+                    except Exception as e:
+                        logger.error(f"Error actualizando estado de campaña {campaign_name} a pausada: {e}")
+                    
+                    await safe_send_to_websocket(send_event_to_websocket, "campaign_paused", {
+                        "campaign": campaign_name,
+                        "reason": "Fuera de horario",
+                        "horario": horario_actual,
+                        "status": "P",
+                        "stats": stats.to_dict()
+                    })
+                    break  # Salir del bucle de envío de lotes
+        except Exception as e:
+            logger.error(f"Error verificando horario para {campaign_name}: {e}")
+            # Continuar si hay error verificando horario
+        
         batch = valid_numbers[i:i + cps]
         log(f"🚩 Enviando lote {i // cps + 1}: {len(batch)} llamadas")
         for numero in batch:
-            uuid = f"{campaign_name}_{numero}"
+            uuid = f"{campaign_name}_{numero}_{int(time.time()*1000)}"
             uuid_map[numero] = uuid
+            # Originate directo al contexto, sin &park()
             originate_str = (
                 f"bgapi originate "
-                f"{{origination_caller_id_name='Outbound',ignore_early_media=true,"
+                f"{{origination_caller_id_name='Outbound',ignore_early_media=false,"
                 f"origination_uuid={uuid},"
+                f"campaign_name='{campaign_name}',"
                 f"origination_caller_id_number='{numero}'}}"
-                f"sofia/gateway/{GATEWAY}/{numero} '&park()'\n\n"
+                f"sofia/gateway/{GATEWAY}/{numero} 2222 XML {campaign_name}"
             )
             con.api(originate_str)
-            # Estado P: siempre poner intentos=1 si es la primera vez
-            update_call_status(campaign_name, numero, "P", engine, incrementar_intento=None, max_intentos=max_intentos)
+            
+            # Insertar el uuid en la base de datos al iniciar la llamada y actualizar fecha_envio
+            try:
+                with engine.begin() as conn:
+                    stmt = text(f"UPDATE {campaign_name} SET uuid = :uuid, fecha_envio = :fecha_envio WHERE telefono = :numero")
+                    conn.execute(stmt, {
+                        "uuid": uuid,
+                        "numero": numero,
+                        "fecha_envio": datetime.now()
+                    })
+            except Exception as e:
+                logger.error(f"Error insertando uuid/fecha_envio para {numero} en {campaign_name}: {e}")
+            # Estado P: siempre poner intentos=1 si es la primera vez y guardar uuid
+            update_call_status(campaign_name, numero, "Pendiente", engine, incrementar_intento=None, max_intentos=max_intentos, uuid=uuid)
             stats.calls_sent += 1
             stats.unique_sent.add(numero)
+            await safe_send_to_websocket(send_event_to_websocket, "call_pending", {
+                "campaign": campaign_name,
+                "numero": numero,
+                "uuid": uuid,
+                "status": "pending",
+                "stats": stats.to_dict()
+            })
             await safe_send_to_websocket(send_stats_to_websocket, {
                 "campaign_name": campaign_name,
                 "total_numbers": len(valid_numbers),
@@ -516,9 +582,11 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
                 **stats.to_dict()
             })
             await asyncio.sleep(delay)
-        for _ in range(cps * 3):
-            await handle_events_inline(con, campaign_name, stats, engine, max_intentos)
         i += cps
+
+    # Espera a que terminen los eventos pendientes
+    await event_task
+    await stats_task
 
     max_wait = 120
     waited = 0
@@ -531,13 +599,22 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
             "cps": cps,
             **stats.to_dict()
         })
+        # --- Verifica que todos los números tengan estado final actualizado ---
         with engine.connect() as conn_db:
-            query = text(f"SELECT COUNT(*) FROM {campaign_name} WHERE estado IN ('P', 'n')")
-            pendientes = conn_db.execute(query).scalar()
+            query = text(f"SELECT telefono, estado, uuid FROM {campaign_name} WHERE telefono IN :nums")
+            result = conn_db.execute(query, {"nums": tuple(valid_numbers)})
+            pendientes = 0
+            for row in result:
+                estado = row[1]
+                uuid_val = row[2]
+                # Si el estado es "S" (contestada), aún no está finalizada
+                if estado == "S" or not uuid_val or estado not in ("C", "E", "O", "N", "U"):
+                    pendientes += 1
         # 🔥 Actualiza stats.calls_answered con la BD para reflejar el valor real
         with engine.connect() as conn_db:
             query = text(f"SELECT COUNT(*) FROM {campaign_name} WHERE estado = 'S'")
             stats.calls_answered = conn_db.execute(query).scalar() or 0
+        # Solo termina si todos los números tienen estado final y uuid asignado (no "S")
         if pendientes == 0 and not stats.active_numbers and not stats.ringing_numbers:
             break
         await asyncio.sleep(0.5)
@@ -567,60 +644,188 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
 async def main():
     engine = create_engine(DB_URL)
     campaigns_data = {}
+    
+    # 🚀 Iniciar WebSocket server inmediatamente al arrancar el script
+    if WEBSOCKET_AVAILABLE:
+        try:
+            from websocket_server import ws_server
+            await ws_server.start_server()
+            logger.info("🌐 WebSocket server iniciado y listo para recibir conexiones")
+            
+            # Enviar mensaje inicial de que el sistema está activo
+            await safe_send_to_websocket(send_event_to_websocket, "system_started", {
+                "message": "Sistema de monitoreo iniciado",
+                "timestamp": datetime.now().isoformat()
+            })
+        except Exception as e:
+            logger.error(f"❌ Error iniciando WebSocket server: {e}")
+    
+    logger.info("🎯 Iniciando bucle principal de monitoreo de campañas...")
 
     while True:
-        with engine.connect() as conn:
-            campaigns = conn.execute(text("SELECT base, reintentos FROM bases WHERE activo = 'S'"))
-            active_campaigns = [(row[0], row[1]) for row in campaigns]
-
-        # Limpiar campañas inactivas
-        inactive = set(campaigns_data.keys()) - set(c for c, _ in active_campaigns)
-        for c in inactive:
-            del campaigns_data[c]
-
-        num_active = len(active_campaigns)
-        cps_global = 30
-        cps_per_campaign = max(1, cps_global // num_active) if num_active > 0 else 1
-
-        # --- NUEVO: lanzar todas las campañas en paralelo ---
-        dialer_tasks = []
-        for campaign_name, max_intentos in active_campaigns:
-            if campaign_name not in campaigns_data:
-                campaigns_data[campaign_name] = {
-                    "stats": None,
-                    "ringing_numbers": [],
-                    "active_numbers": [],
-                    "answered_numbers": [],
-                    "failed_numbers": [],
-                    "busy_numbers": [],
-                    "no_answer_numbers": [],
-                    "stats_obj": DialerStats(campaign_name=campaign_name),
-                }
-
+        try:
             with engine.connect() as conn:
-                query = text(f"""
-                    SELECT telefono, intentos 
-                    FROM {campaign_name} 
-                    WHERE estado = 'n' 
-                    AND intentos < :max_intentos
-                    LIMIT 1000
-                """)
-                result = conn.execute(query, {"max_intentos": max_intentos})
-                numbers = [row[0] for row in result]
+                # Solo seleccionar campañas tipo 'Audio', fecha_programada válida y horario actual permitido
+                # INCLUIR campañas marcadas como 'F' (finalizadas) que hayan sido reactivadas a 'S'
+                campaigns = conn.execute(
+                    text("""
+                        SELECT nombre, reintentos, horarios 
+                        FROM campañas 
+                        WHERE activo = 'S' 
+                        AND tipo = 'Audio'
+                        AND (fecha_programada IS NULL OR fecha_programada <= NOW())
+                    """)
+                )
+                
+                # 🔄 Verificar campañas pausadas (P) para reactivarlas si entran en horario
+                paused_campaigns = conn.execute(
+                    text("""
+                        SELECT nombre, reintentos, horarios 
+                        FROM campañas 
+                        WHERE activo = 'P' 
+                        AND tipo = 'Audio'
+                        AND (fecha_programada IS NULL OR fecha_programada <= NOW())
+                    """)
+                )
+                
+                # Procesar campañas pausadas
+                for row in paused_campaigns:
+                    nombre, reintentos, horario = row[0], row[1], row[2] if len(row) > 2 else None
+                    if is_now_in_campaign_schedule(horario):
+                        logger.info(f"🔄 Campaña {nombre} pausada entrando en horario ({horario}) - reactivando")
+                        try:
+                            with engine.begin() as conn_reactivate:
+                                conn_reactivate.execute(text("UPDATE campañas SET activo = 'S' WHERE nombre = :nombre"), {"nombre": nombre})
+                                logger.info(f"✅ Campaña {nombre} reactivada automáticamente (P → S)")
+                                
+                                if WEBSOCKET_AVAILABLE:
+                                    await safe_send_to_websocket(send_event_to_websocket, "campaign_reactivated", {
+                                        "campaign_name": nombre,
+                                        "reason": "Entrada en horario",
+                                        "horario": horario,
+                                        "previous_status": "P",
+                                        "new_status": "S",
+                                        "timestamp": datetime.now().isoformat()
+                                    })
+                        except Exception as e:
+                            logger.error(f"Error reactivando campaña {nombre}: {e}")
+                    else:
+                        logger.debug(f"⏸️ Campaña pausada {nombre} aún fuera de horario ({horario})")
+                
+                # Filtrar campañas por horario permitido
+                active_campaigns = []
+                for row in campaigns:
+                    nombre, reintentos, horario = row[0], row[1], row[2] if len(row) > 2 else None
+                    if is_now_in_campaign_schedule(horario):
+                        active_campaigns.append((nombre, reintentos))
+                    else:
+                        logger.info(f"⏸️ Campaña {nombre} fuera de horario ({horario}), no se marcará en este ciclo.")
 
-            stats = campaigns_data[campaign_name]["stats_obj"]
-            stats.campaign_name = campaign_name
+            # Limpiar campañas inactivas y finalizar campañas
+            inactive = set(campaigns_data.keys()) - set(c for c, _ in active_campaigns)
+            for c in inactive:
+                if WEBSOCKET_AVAILABLE:
+                    await safe_send_to_websocket(send_event_to_websocket, "campaign_finished", {
+                        "campaign_name": c,
+                        "message": "Campaña finalizada"
+                    })
+                del campaigns_data[c]
 
-            if not numbers:
-                logger.info(f"No hay números pendientes para la campaña {campaign_name}")
-                await safe_send_to_websocket(send_event_to_websocket, "campaign_idle", {
-                    "campaign_name": campaign_name,
-                    "message": "Campaña sin números pendientes"
+            # 📡 Enviar heartbeat cada ciclo para mantener conexiones activas
+            if WEBSOCKET_AVAILABLE:
+                await safe_send_to_websocket(send_event_to_websocket, "system_heartbeat", {
+                    "active_campaigns": len(active_campaigns),
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "running"
                 })
+
+            num_active = len(active_campaigns)
+            
+            if num_active == 0:
+                logger.info("⏸️ No hay campañas activas. WebSocket permanece activo...")
+                # Enviar stats vacías para mantener la interfaz actualizada
+                if WEBSOCKET_AVAILABLE:
+                    await safe_send_to_websocket(send_stats_to_websocket, {
+                        "type": "multi_campaign_stats",
+                        "data": [],
+                        "message": "No hay campañas activas"
+                    })
+                await asyncio.sleep(10)
+                continue
+
+            cps_global = 50
+            cps_per_campaign = max(1, cps_global // num_active) if num_active > 0 else 1
+
+            dialer_tasks = []
+            for campaign_name, max_intentos in active_campaigns:
+                if campaign_name not in campaigns_data:
+                    campaigns_data[campaign_name] = {
+                        "stats": None,
+                        "ringing_numbers": [],
+                        "active_numbers": [],
+                        "answered_numbers": [],
+                        "failed_numbers": [],
+                        "busy_numbers": [],
+                        "no_answer_numbers": [],
+                        "stats_obj": DialerStats(campaign_name=campaign_name),
+                    }
+
+                stats = campaigns_data[campaign_name]["stats_obj"]
+                stats.campaign_name = campaign_name
+
+                # Obtener números pendientes de la base
+                with engine.connect() as conn:
+                    # --- NUEVO: Si la campaña tiene horario, solo marcar si está en horario ---
+                    horario = None
+                    try:
+                        res = conn.execute(text(f"SELECT horarios FROM campañas WHERE nombre = :nombre"), {"nombre": campaign_name}).fetchone()
+                        if res:
+                            horario = res[0]
+                    except Exception:
+                        pass
+                    if horario and not is_now_in_campaign_schedule(horario):
+                        logger.info(f"⏸️ Campaña {campaign_name} fuera de horario ({horario}), no se marcarán números pendientes.")
+                        numbers = []
+                    else:
+                        # Incluir números con estado 'pendiente' Y números que pueden ser re-intentados
+                        query = text(f"""
+                            SELECT telefono FROM {campaign_name} 
+                            WHERE (estado = 'pendiente' AND intentos < :max_intentos)
+                            OR (estado IN ('N', 'U', 'E', 'R', 'I', 'X', 'T') AND intentos < :max_intentos)
+                        """)
+                        result = conn.execute(query, {"max_intentos": max_intentos})
+                        numbers = [row[0] for row in result]
+                        
+                        logger.info(f"📋 Campaña {campaign_name}: {len(numbers)} números disponibles para marcar")
+
+                destino = "9999"
+                cps = cps_per_campaign
+
+                logger.info(f"Iniciando dialer para campaña {campaign_name} con {len(numbers)} números (máx intentos: {max_intentos}, cps: {cps})")
+                
+                # 📊 Enviar estado inicial de la campaña
+                if WEBSOCKET_AVAILABLE:
+                    await safe_send_to_websocket(send_event_to_websocket, "campaign_started", {
+                        "campaign_name": campaign_name,
+                        "total_numbers": len(numbers),
+                        "max_intentos": max_intentos,
+                        "cps": cps
+                    })
+                
+                dialer_tasks.append(
+                    asyncio.create_task(
+                        send_all_calls_persistent(numbers, cps, destino, campaign_name, max_intentos, stats)
+                    )
+                )
+
+            if dialer_tasks:
+                await asyncio.gather(*dialer_tasks)
+
+            # Actualizar stats y arrays por campaña después de terminar los dialers
+            for campaign_name in campaigns_data:
+                stats = campaigns_data[campaign_name]["stats_obj"]
                 campaigns_data[campaign_name]["stats"] = stats.to_dict()
                 campaigns_data[campaign_name]["stats"]["campaign_name"] = campaign_name
-                campaigns_data[campaign_name]["stats"]["total_numbers"] = 0
-                campaigns_data[campaign_name]["stats"]["cps"] = 0
                 campaigns_data[campaign_name]["stats"]["timestamp"] = datetime.now().isoformat()
                 campaigns_data[campaign_name]["ringing_numbers"] = list(getattr(stats, "ringing_numbers", []))
                 campaigns_data[campaign_name]["active_numbers"] = list(getattr(stats, "active_numbers", []))
@@ -628,55 +833,37 @@ async def main():
                 campaigns_data[campaign_name]["failed_numbers"] = list(getattr(stats, "unique_failed", []))
                 campaigns_data[campaign_name]["busy_numbers"] = list(getattr(stats, "unique_busy", []))
                 campaigns_data[campaign_name]["no_answer_numbers"] = list(getattr(stats, "unique_no_answer", []))
-                continue
 
-            destino = "9999"
-            cps = cps_per_campaign
+            # Enviar stats y arrays de todas las campañas activas al WebSocket
+            if campaigns_data and WEBSOCKET_AVAILABLE:
+                await safe_send_to_websocket(send_stats_to_websocket, {
+                    "type": "multi_campaign_stats",
+                    "data": [
+                        {
+                            **campaigns_data[c]["stats"],
+                            "ringing_numbers": campaigns_data[c]["ringing_numbers"],
+                            "active_numbers": campaigns_data[c]["active_numbers"],
+                            "answered_numbers": campaigns_data[c]["answered_numbers"],
+                            "failed_numbers": campaigns_data[c]["failed_numbers"],
+                            "busy_numbers": campaigns_data[c]["busy_numbers"],
+                            "no_answer_numbers": campaigns_data[c]["no_answer_numbers"],
+                        }
+                        for c in campaigns_data
+                    ]
+                })
 
-            logger.info(f"Iniciando dialer para campaña {campaign_name} con {len(numbers)} números (máx intentos: {max_intentos}, cps: {cps})")
-            # Lanzar cada campaña como tarea asíncrona
-            dialer_tasks.append(
-                asyncio.create_task(
-                    send_all_calls_persistent(numbers, cps, destino, campaign_name, max_intentos, stats)
-                )
-            )
+            await asyncio.sleep(5)  # Más frecuente para updates más rápidos
+            
+        except Exception as e:
+            logger.error(f"❌ Error en bucle principal: {e}")
+            # Mantener WebSocket activo incluso si hay errores
+            if WEBSOCKET_AVAILABLE:
+                await safe_send_to_websocket(send_event_to_websocket, "system_error", {
+                    "error": str(e),
+                    "timestamp": datetime.now().isoformat()
+                })
+            await asyncio.sleep(5)
 
-        # Esperar a que todas las campañas terminen su dialer antes de enviar stats globales
-        if dialer_tasks:
-            await asyncio.gather(*dialer_tasks)
-
-        # Actualizar stats y arrays por campaña después de terminar los dialers
-        for campaign_name in campaigns_data:
-            stats = campaigns_data[campaign_name]["stats_obj"]
-            campaigns_data[campaign_name]["stats"] = stats.to_dict()
-            campaigns_data[campaign_name]["stats"]["campaign_name"] = campaign_name
-            campaigns_data[campaign_name]["stats"]["timestamp"] = datetime.now().isoformat()
-            campaigns_data[campaign_name]["ringing_numbers"] = list(getattr(stats, "ringing_numbers", []))
-            campaigns_data[campaign_name]["active_numbers"] = list(getattr(stats, "active_numbers", []))
-            campaigns_data[campaign_name]["answered_numbers"] = list(getattr(stats, "unique_answered", []))
-            campaigns_data[campaign_name]["failed_numbers"] = list(getattr(stats, "unique_failed", []))
-            campaigns_data[campaign_name]["busy_numbers"] = list(getattr(stats, "unique_busy", []))
-            campaigns_data[campaign_name]["no_answer_numbers"] = list(getattr(stats, "unique_no_answer", []))
-
-        # Enviar stats y arrays de todas las campañas activas al WebSocket
-        if campaigns_data:
-            await safe_send_to_websocket(send_stats_to_websocket, {
-                "type": "multi_campaign_stats",
-                "data": [
-                    {
-                        **campaigns_data[c]["stats"],
-                        "ringing_numbers": campaigns_data[c]["ringing_numbers"],
-                        "active_numbers": campaigns_data[c]["active_numbers"],
-                        "answered_numbers": campaigns_data[c]["answered_numbers"],
-                        "failed_numbers": campaigns_data[c]["failed_numbers"],
-                        "busy_numbers": campaigns_data[c]["busy_numbers"],
-                        "no_answer_numbers": campaigns_data[c]["no_answer_numbers"],
-                    }
-                    for c in campaigns_data
-                ]
-            })
-
-        await asyncio.sleep(10)
 
 if __name__ == "__main__":
     try:

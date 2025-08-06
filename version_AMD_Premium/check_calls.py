@@ -566,6 +566,8 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
     event_task = asyncio.create_task(event_processor())
 
     while i < total:
+        batch = valid_numbers[i:i + cps]
+        
         # 🕐 Validar horario antes de enviar cada lote
         try:
             with engine.connect() as conn_schedule:
@@ -591,11 +593,49 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
                         "stats": stats.to_dict()
                     })
                     break  # Salir del bucle de envío de lotes
+                else:
+                    log(f"✅ Campaña {campaign_name} dentro del horario permitido ({horario_actual or 'Sin restricción'})")
+                    
+                    # 🔄 Verificar si hay campañas pausadas que ahora están en horario para reactivarlas
+                    try:
+                        with engine.connect() as conn_paused:
+                            paused_campaigns = conn_paused.execute(
+                                text("""
+                                    SELECT nombre, horarios 
+                                    FROM campañas 
+                                    WHERE activo = 'P' 
+                                    AND tipo = 'Audio'
+                                    AND (fecha_programada IS NULL OR fecha_programada <= NOW())
+                                """)
+                            )
+                            
+                            # Procesar campañas pausadas para reactivarlas si están en horario
+                            for paused_row in paused_campaigns:
+                                paused_nombre, paused_horario = paused_row[0], paused_row[1]
+                                if is_now_in_campaign_schedule(paused_horario):
+                                    logger.info(f"🔄 Campaña pausada {paused_nombre} entrando en horario ({paused_horario}) - reactivando")
+                                    try:
+                                        with engine.begin() as conn_reactivate:
+                                            conn_reactivate.execute(text("UPDATE campañas SET activo = 'S' WHERE nombre = :nombre"), {"nombre": paused_nombre})
+                                            logger.info(f"✅ Campaña {paused_nombre} reactivada automáticamente (P → S)")
+                                            
+                                            await safe_send_to_websocket(send_event_to_websocket, "campaign_reactivated", {
+                                                "campaign_name": paused_nombre,
+                                                "reason": "Entrada en horario durante ejecución",
+                                                "horario": paused_horario,
+                                                "previous_status": "P",
+                                                "new_status": "S",
+                                                "timestamp": datetime.now().isoformat(),
+                                                "triggered_by": campaign_name
+                                            })
+                                    except Exception as e:
+                                        logger.error(f"Error reactivando campaña pausada {paused_nombre}: {e}")
+                    except Exception as e:
+                        logger.error(f"Error verificando campañas pausadas para reactivar: {e}")
         except Exception as e:
             logger.error(f"Error verificando horario para {campaign_name}: {e}")
             # Continuar si hay error verificando horario
         
-        batch = valid_numbers[i:i + cps]
         log(f"🚩 Enviando lote {i // cps + 1}: {len(batch)} llamadas")
         for numero in batch:
             uuid = f"{campaign_name}_{numero}_{int(time.time()*1000)}"
@@ -607,7 +647,7 @@ async def send_all_calls_persistent(numbers, cps, destino, campaign_name, max_in
                 f"origination_uuid={uuid},"
                 f"campaign_name='{campaign_name}',"
                 f"origination_caller_id_number='{numero}'}}"
-                f"sofia/gateway/{GATEWAY}/{numero} 2222 XML {campaign_name}"
+                f"sofia/gateway/{GATEWAY}/{numero} 2222 XML DETECT_AMD_PRO"
             )
             con.api(originate_str)
             
