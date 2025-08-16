@@ -8,35 +8,13 @@ Type=simple
 User=luis
 Group=www-data
 WorkingDirectory=/var/www/BestFSDialer
-ExecStart=/bin/bash -c 'source ./venv37/bin/activate && export PYTHONPATH=/usr/src/freeswitch/libs/esl/python3 && python3.7 ./check_calls.py'
+ExecStart=/bin/bash -c 'source ./venv/bin/activate && export PYTHONPATH=/usr/src/freeswitch/libs/esl/python3 && python3 ./check_calls.py'
 Restart=always
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=BestFSDialer
 
-
-[Install]
-WantedBy=multi-user.target
-
-
-[Unit]
-Description=API Discador FreeSWITCH
-After=network.target mysql.service freeswitch.service
-Wants=mysql.service freeswitch.service
-
-[Service]
-Type=simple
-User=luis
-Group=www-data
-WorkingDirectory=/var/www/Best_FS_amd/API
-Environment=PATH=/var/www/Best_FS_amd/API/venv/bin
-ExecStart=/var/www/Best_FS_amd/venv/API/bin/uvicorn main:app --host 0.0.0.0 --port 8009
-Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=Best_FS_amd
 
 [Install]
 WantedBy=multi-user.target

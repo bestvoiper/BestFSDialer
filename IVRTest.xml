@@ -1,0 +1,61 @@
+<include>
+  <context name="Test2">
+      
+    <!-- Extensión inicial: contestar y enviar al menú -->
+    <extension name="execute_on_answer">
+      <condition field="destination_number" expression="^9999$">
+        <action application="set" data="call_uuid=${uuid}"/>
+        <action application="answer"/>
+        <action application="sleep" data="1000"/>
+        <action application="transfer" data="1000 XML Test2"/>
+      </condition>
+    </extension>
+
+    <!-- Menú principal -->
+    <extension name="ivr_main-Test2">
+      <condition field="destination_number" expression="^1000$">
+
+        <action application="play_and_get_digits" 
+                data="1 1 3 3000 # /var/www/bestcallcenter/masivosAudios/Test2.wav /usr/local/freeswitch/sounds/es/invalid.wav user_input ^[12]$ 3000"/>
+        <action application="export" data="opcion=${user_input}"/>
+        <action application="execute_extension" data="procesar_opcion_Test2 XML Test2"/>
+
+        <!-- Segundo intento -->
+        <action application="play_and_get_digits" 
+                data="1 1 3 3000 # /var/www/bestcallcenter/masivosAudios/Test2.wav /usr/local/freeswitch/sounds/es/invalid.wav user_input ^[12]$ 3000"/>
+        <action application="export" data="opcion=${user_input}"/>
+        <action application="execute_extension" data="procesar_opcion_Test2 XML Test2"/>
+
+        <!-- Tercer intento -->
+          <action application="play_and_get_digits" 
+                data="1 1 3 3000 # /var/www/bestcallcenter/masivosAudios/Test2.wav /usr/local/freeswitch/sounds/es/invalid.wav user_input ^[12]$ 3000"/>
+        <action application="export" data="opcion=${user_input}"/>
+        <action application="execute_extension" data="procesar_opcion_Test2 XML Test2"/>
+
+        <!-- Si no presiona nada -->
+        <action application="hangup" data="NORMAL_CLEARING"/>
+
+      </condition>
+    </extension>
+
+    <!-- Procesar las opciones -->
+    <extension name="procesar_opcion_Test2">
+
+      <!-- Si presiona 1: enviar al otro servidor -->
+      <condition field="${opcion}" expression="^1$">
+        <action application="bridge" data="sofia/gateway/otro_servidor/2000"/>
+      </condition>
+
+      <!-- Si presiona 2: reproducir audio -->
+      <condition field="${opcion}" expression="^2$">
+        <action application="playback" data="/usr/local/freeswitch/sounds/es/opcion2.wav"/>
+      </condition>
+
+      <!-- Si no presiona nada o es inválido: repetir menú -->
+      <condition field="${opcion}" expression="^$">
+        <action application="transfer" data="1000 XML Test2"/>
+      </condition>
+
+    </extension>
+  </context>
+</include>

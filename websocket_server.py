@@ -35,7 +35,7 @@ class StatsWebSocketServer:
         self.client_ids = {}  # {websocket: unique_client_id}
         self.next_client_id = 1
         self.campaign_change_triggers = {}  # {campaign_name: asyncio.Event}
-        self.active_monitors = set()  # campañas actualmente monitoreadas
+        self.active_monitors = set()  # campanas actualmente monitoreadas
         # Nuevos atributos para detección de cambios en DB
         self.last_db_hash = None
         self.last_system_hash = None
@@ -44,16 +44,16 @@ class StatsWebSocketServer:
         self.recent_calls_monitors = {}  # {campaign_name: set(client_id)}
 
     async def get_database_status(self):
-        """Obtiene el estado de las campañas desde la base de datos"""
+        """Obtiene el estado de las campanas desde la base de datos"""
         try:
             from sqlalchemy import create_engine, text as sql_text
-            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
             
             with engine.begin() as conn:
-                # Obtener estado de campañas
+                # Obtener estado de campanas
                 campaigns_result = conn.execute(sql_text("""
                     SELECT nombre, activo, fechacarga
-                    FROM campañas 
+                    FROM campanas 
                     ORDER BY fechacarga DESC
                 """))
                 campaigns = []
@@ -162,20 +162,20 @@ class StatsWebSocketServer:
         """Obtiene el estado general del sistema"""
         try:
             from sqlalchemy import create_engine, text as sql_text
-            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
             
             with engine.begin() as conn:
-                # Contar campañas por estado
+                # Contar campanas por estado
                 active_campaigns = conn.execute(sql_text("""
-                    SELECT COUNT(*) FROM campañas WHERE activo = 'S'
+                    SELECT COUNT(*) FROM campanas WHERE activo = 'S'
                 """)).scalar() or 0
                 
                 inactive_campaigns = conn.execute(sql_text("""
-                    SELECT COUNT(*) FROM campañas WHERE activo = 'N'
+                    SELECT COUNT(*) FROM campanas WHERE activo = 'N'
                 """)).scalar() or 0
                 
                 total_campaigns = conn.execute(sql_text("""
-                    SELECT COUNT(*) FROM campañas
+                    SELECT COUNT(*) FROM campanas
                 """)).scalar() or 0
                 
                 return {
@@ -203,12 +203,12 @@ class StatsWebSocketServer:
         """Obtiene detalles específicos de una campaña"""
         try:
             from sqlalchemy import create_engine, text as sql_text
-            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
             
             with engine.begin() as conn:
                 # Detalles de la campaña
                 campaign_result = conn.execute(sql_text("""
-                    SELECT * FROM campañas WHERE nombre = :campaign
+                    SELECT * FROM campanas WHERE nombre = :campaign
                 """), {"campaign": campaign_name})
                 campaign = campaign_result.fetchone()
                 
@@ -405,7 +405,7 @@ class StatsWebSocketServer:
                 live = data.get("live", False)
                 if campaign_name:
                     from sqlalchemy import create_engine, text as sql_text
-                    engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+                    engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
                     
                     with engine.begin() as conn:
                         # Obtener estadísticas actualizadas incluyendo AMD y estados específicos
@@ -480,7 +480,7 @@ class StatsWebSocketServer:
         """Obtiene un hash de los datos importantes de la base de datos para detectar cambios"""
         try:
             from sqlalchemy import create_engine, text as sql_text
-            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
             
             with engine.begin() as conn:
                 # Hash basado en datos importantes que queremos monitorear
@@ -490,12 +490,12 @@ class StatsWebSocketServer:
                         COUNT(CASE WHEN activo = 'S' THEN 1 END) as active_campaigns,
                         COUNT(CASE WHEN activo = 'N' THEN 1 END) as inactive_campaigns,
                         MAX(fechacarga) as last_modified
-                    FROM campañas
+                    FROM campanas
                 """)).fetchone()
                 
                 # Para cada campaña activa, obtener un hash de sus estadísticas
                 campaigns_result = conn.execute(sql_text("""
-                    SELECT nombre FROM campañas ORDER BY nombre
+                    SELECT nombre FROM campanas ORDER BY nombre
                 """))
                 
                 campaign_stats = []
@@ -538,13 +538,13 @@ class StatsWebSocketServer:
         """Obtiene un hash específico de una campaña para detectar cambios"""
         try:
             from sqlalchemy import create_engine, text as sql_text
-            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
             
             with engine.begin() as conn:
                 # Hash de la campaña en la tabla principal
                 campaign_result = conn.execute(sql_text("""
                     SELECT activo, fechacarga, reintentos 
-                    FROM campañas WHERE nombre = :campaign
+                    FROM campanas WHERE nombre = :campaign
                 """), {"campaign": campaign_name}).fetchone()
                 
                 if not campaign_result:
@@ -618,9 +618,9 @@ class StatsWebSocketServer:
                     })
                     await self._broadcast(message)
                 
-                # Verificar cambios en campañas específicas que están siendo monitoreadas
+                # Verificar cambios en campanas específicas que están siendo monitoreadas
                 monitored_campaigns = set(self.monitored_campaigns.values())
-                # También incluir campañas con clientes suscritos a recent_calls en vivo
+                # También incluir campanas con clientes suscritos a recent_calls en vivo
                 live_recent_calls_campaigns = set(self.recent_calls_monitors.keys())
                 all_monitored = monitored_campaigns | live_recent_calls_campaigns
                 for campaign_name in all_monitored:
@@ -642,14 +642,14 @@ class StatsWebSocketServer:
                         if recent_calls_clients:
                             await self._notify_recent_calls_change(campaign_name, details.get("recent_calls", []), recent_calls_clients)
                 
-                # 🏁 Verificar finalización automática de campañas activas
+                # 🏁 Verificar finalización automática de campanas activas
                 try:
                     from sqlalchemy import create_engine, text as sql_text
-                    engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+                    engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
                     with engine.begin() as conn:
-                        # Obtener todas las campañas activas (S)
+                        # Obtener todas las campanas activas (S)
                         active_campaigns_result = conn.execute(sql_text("""
-                            SELECT nombre FROM campañas WHERE activo = 'S'
+                            SELECT nombre FROM campanas WHERE activo = 'S'
                         """))
                         
                         for row in active_campaigns_result:
@@ -671,7 +671,7 @@ class StatsWebSocketServer:
                                     # Marcar la campaña como finalizada en la BD (activo = 'F')
                                     try:
                                         conn.execute(sql_text(
-                                            "UPDATE campañas SET activo = 'F' WHERE nombre = :campaign"
+                                            "UPDATE campanas SET activo = 'F' WHERE nombre = :campaign"
                                         ), {"campaign": campaign_name})
                                         
                                         await self.broadcast_event("campaign_finished", {
@@ -692,7 +692,7 @@ class StatsWebSocketServer:
                                         logger.error(f"Error marcando campaña '{campaign_name}' como finalizada (F): {e}")
                                         
                 except Exception as e:
-                    logger.error(f"Error verificando finalización de campañas: {e}")
+                    logger.error(f"Error verificando finalización de campanas: {e}")
                 
                 # Esperar antes de la siguiente verificación
                 await asyncio.sleep(2)  # Verificar cada 2 segundos
@@ -744,7 +744,7 @@ class StatsWebSocketServer:
         # Obtener las estadísticas actualizadas de la campaña
         try:
             from sqlalchemy import create_engine, text as sql_text
-            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos", future=False)
+            engine = create_engine("mysql+pymysql://consultas:consultas@localhost/masivos")
             
             with engine.begin() as conn:
                 # Obtener estadísticas actualizadas incluyendo AMD y estados específicos
@@ -930,7 +930,7 @@ class StatsWebSocketServer:
         })
         await self._broadcast(message)
 
-    # Limpieza periódica de campañas finalizadas (llamar cada cierto tiempo)
+    # Limpieza periódica de campanas finalizadas (llamar cada cierto tiempo)
     async def cleanup_finished_campaigns(self):
         while True:
             now = datetime.now()

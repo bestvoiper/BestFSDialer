@@ -9,6 +9,7 @@ import csv
 import ESL
 import argparse
 import sys
+from sqlalchemy import create_engine, text
 
 # === Argumentos CLI ===
 DEFAULT_PORT = 8082
@@ -36,7 +37,7 @@ MAX_CONNECTIONS = args.max_connections if args.max_connections else DEFAULT_MAX_
 SAMPLE_RATE = 16000
 CSV_FILENAME = "./recordings/buzon_detectados.csv"
 VOSK_GRAMMAR = [
-    "disponible", "deje su mensaje", "número", "suspendido", "buzón", "cobrada", "cobrado", "costo", "mensajes", "lo sentimos",
+    "disponible", "deje su mensaje", "numero", "suspendido", "buzon", "costo", "mensajes", "lo sentimos",
     "temporalmente", "ocupado", "mensaje", "contestador",
     "correo", "persona", "voz", "grabar", "marcado", "buzon", "sistema", "transferira", "su llamara", "se llamara", 
     "esta siendo", "despues", "después", "del tono", "momento", "despues del tono", "después del tono", "contestador",
@@ -49,6 +50,9 @@ if not os.path.exists(MODEL_PATH):
 model = Model(MODEL_PATH)
 if VERBOSE:
     print(f"✅ Modelo Vosk cargado desde {MODEL_PATH}")
+
+# === Configuración de base de datos ===
+DB_URL = "mysql+pymysql://consultas:consultas@localhost/masivos"
 
 # === Guardar detección ===
 def save_buzon_uuid(uuid, text, tipo="final"):
@@ -82,8 +86,29 @@ def save_transcription_no_grammar_to_file(uuid, transcription, folder="./recordi
         f.write(transcription)
 
 # === Colgar llamada ===
-def hangup_call(uuid):
+def update_amd_result(uuid, campaign_name, amd_result="MACHINE"):
+    """
+    Actualiza el campo amd_result en la base de datos para el UUID específico.
+    """
     try:
+        engine = create_engine(DB_URL)
+        with engine.begin() as conn:
+            stmt = text(f"UPDATE {campaign_name} SET amd_result = :amd_result, estado = 'C' WHERE uuid = :uuid")
+            result = conn.execute(stmt, {"amd_result": amd_result, "uuid": uuid})
+            if result.rowcount > 0:
+                print(f"✅ AMD result actualizado para {uuid}: {amd_result}, estado: C")
+            else:
+                print(f"⚠️ No se encontró registro para UUID {uuid} en campaña {campaign_name}")
+    except Exception as e:
+        print(f"🚨 Error actualizando amd_result para {uuid}: {e}")
+
+def hangup_call(uuid, campaign_name=None):
+    try:
+        # Actualizar amd_result en la base de datos si se proporciona campaign_name
+        if campaign_name:
+            update_amd_result(uuid, campaign_name, "MACHINE")
+        
+        # Colgar la llamada via ESL
         con = ESL.ESLconnection("127.0.0.1", 8021, "1Pl}0F~~801l")
         if con.connected():
             res = con.api("uuid_kill", uuid)
@@ -96,11 +121,68 @@ def hangup_call(uuid):
 # === Lógica por conexión WebSocket ===
 active_connections = set()
 
-async def handle_connection(websocket, path):
-    query = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(path).query))
-    uuid = query.get("uuid", f"unknown_{int(asyncio.get_event_loop().time())}")
-    numero = query.get("numero", "numero_desconocido")
-    print(f"✅ Nueva conexión: {numero} ({uuid})")
+async def handle_connection(websocket, path=None):
+    connection_path = None
+    uuid = None
+    numero = None
+    campaign = None
+    
+    try:
+        # Intentar obtener el path de diferentes maneras según la versión de websockets
+        if path is not None:
+            # Versiones más antiguas pasan el path como parámetro
+            connection_path = path
+            print(f"🔗 Path obtenido como parámetro: {connection_path}")
+        elif hasattr(websocket, 'path') and websocket.path:
+            connection_path = websocket.path
+            print(f"🔗 Path obtenido de websocket.path: {connection_path}")
+        elif hasattr(websocket, 'request_uri') and websocket.request_uri:
+            connection_path = websocket.request_uri
+            print(f"🔗 Path obtenido de websocket.request_uri: {connection_path}")
+        elif hasattr(websocket, 'uri') and websocket.uri:
+            connection_path = websocket.uri
+            print(f"🔗 Path obtenido de websocket.uri: {connection_path}")
+        elif hasattr(websocket, 'request') and hasattr(websocket.request, 'path'):
+            connection_path = websocket.request.path
+            print(f"🔗 Path obtenido de websocket.request.path: {connection_path}")
+        else:
+            # Intentar obtener información de headers o raw_request_line
+            if hasattr(websocket, 'request_uri'):
+                connection_path = str(websocket.request_uri)
+            elif hasattr(websocket, 'raw_request_line'):
+                raw_line = str(websocket.raw_request_line)
+                if 'GET ' in raw_line and ' HTTP' in raw_line:
+                    connection_path = raw_line.split('GET ')[1].split(' HTTP')[0]
+                    print(f"🔗 Path extraído de raw_request_line: {connection_path}")
+            
+            if not connection_path:
+                print(f"❌ No se pudo obtener el path de la conexión WebSocket")
+                print(f"📊 Atributos disponibles en websocket: {[attr for attr in dir(websocket) if not attr.startswith('_')]}")
+                return
+        
+        if connection_path:
+            # Extraer parámetros de la query string
+            parsed_url = urllib.parse.urlparse(connection_path)
+            query = dict(urllib.parse.parse_qsl(parsed_url.query))
+            uuid = query.get("uuid")
+            numero = query.get("numero")
+            campaign = query.get("campaign")
+            
+            print(f"✅ Parámetros extraídos - UUID: {uuid}, Número: {numero}, Campaña: {campaign}")
+            
+            if not uuid or not numero:
+                print(f"⚠️ Parámetros incompletos en la URL: {connection_path}")
+                return
+        else:
+            print(f"❌ No se pudo obtener connection_path")
+            return
+            
+    except Exception as e:
+        print(f"🚨 Error obteniendo parámetros de conexión: {e}")
+        print(f"📊 Tipo de websocket: {type(websocket)}")
+        return
+
+    print(f"✅ Nueva conexión: {numero} ({uuid}) de campaña {campaign}")
 
     if len(active_connections) >= MAX_CONNECTIONS:
         print(f"⚠️ Máximo de conexiones alcanzado ({MAX_CONNECTIONS}), rechazando nueva conexión")
@@ -128,7 +210,7 @@ async def handle_connection(websocket, path):
 
                     if any(kw in text for kw in VOSK_GRAMMAR):
                         await websocket.send(json.dumps({"action": "colgar", "uuid": uuid, "text": text}))
-                        hangup_call(uuid)
+                        hangup_call(uuid, campaign)
                         await asyncio.sleep(0.5)
                         try:
                             await websocket.close(code=1000, reason="Hangup detected")
@@ -146,7 +228,7 @@ async def handle_connection(websocket, path):
                         save_buzon_uuid(uuid, partial, "partial")
                         if any(kw in partial for kw in VOSK_GRAMMAR):
                             await websocket.send(json.dumps({"action": "colgar", "uuid": uuid, "text": partial}))
-                            hangup_call(uuid)
+                            hangup_call(uuid, campaign)
                             await asyncio.sleep(0.5)
                             try:
                                 await websocket.close(code=1000, reason="Hangup detected")
